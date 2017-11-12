@@ -1,9 +1,27 @@
-﻿namespace FluentValidation.AspNetCore {
+﻿#region License
+// Copyright (c) Jeremy Skinner (http://www.jeremyskinner.co.uk)
+// 
+// Licensed under the Apache License, Version 2.0 (the "License"); 
+// you may not use this file except in compliance with the License. 
+// You may obtain a copy of the License at 
+// 
+// http://www.apache.org/licenses/LICENSE-2.0 
+// 
+// Unless required by applicable law or agreed to in writing, software 
+// distributed under the License is distributed on an "AS IS" BASIS, 
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. 
+// See the License for the specific language governing permissions and 
+// limitations under the License.
+// 
+// The latest version of this file can be found at https://github.com/jeremyskinner/FluentValidation
+#endregion
+
+
+namespace FluentValidation.AspNetCore {
 	using System;
 	using System.Collections.Generic;
 	using System.ComponentModel.DataAnnotations;
 	using System.Linq;
-	using System.Linq.Expressions;
 	using System.Reflection;
 	using Microsoft.AspNetCore.Mvc;
 	using Microsoft.AspNetCore.Mvc.Controllers;
@@ -11,7 +29,144 @@
 	using Microsoft.AspNetCore.Mvc.ModelBinding;
 	using Microsoft.AspNetCore.Mvc.ModelBinding.Validation;
 
-	public class FluentValidationObjectModelValidator : IObjectModelValidator {
+	internal class FluentValidationObjectModelValidator : IObjectModelValidator {
+		private readonly IModelMetadataProvider _modelMetadataProvider;
+		private readonly bool _runMvcValidation;
+		private readonly ValidatorCache _validatorCache;
+		private readonly IModelValidatorProvider _compositeProvider;
+		private readonly FluentValidationModelValidatorProvider _fvProvider;
+
+		public FluentValidationObjectModelValidator(
+			IModelMetadataProvider modelMetadataProvider,
+			IList<IModelValidatorProvider> validatorProviders, bool runMvcValidation) {
+
+			if (modelMetadataProvider == null) {
+				throw new ArgumentNullException(nameof(modelMetadataProvider));
+			}
+
+			if (validatorProviders == null) {
+				throw new ArgumentNullException(nameof(validatorProviders));
+			}
+
+			_modelMetadataProvider = modelMetadataProvider;
+			_runMvcValidation = runMvcValidation;
+			_validatorCache = new ValidatorCache();
+			_fvProvider = validatorProviders.SingleOrDefault(x => x is FluentValidationModelValidatorProvider) as FluentValidationModelValidatorProvider;
+			_compositeProvider = new CompositeModelValidatorProvider(validatorProviders); //.Except(new IModelValidatorProvider[]{ _fvProvider }).ToList());
+		}
+
+		public void Validate(ActionContext actionContext, ValidationStateDictionary validationState, string prefix, object model) {
+
+			var requiredErrorsNotHandledByFv = RemoveImplicitRequiredErrors(actionContext);
+
+			// Apply any customizations made with the CustomizeValidatorAttribute 
+			var metadata = model == null ? null : _modelMetadataProvider.GetMetadataForType(model.GetType());
+
+			if (model != null) {
+				var customizations = GetCustomizations(actionContext, model.GetType(), prefix);
+				actionContext.HttpContext.Items["_FV_Customizations"] = Tuple.Create(model, customizations);
+			}
+
+			// Setting as to whether we should run only FV or FV + the other validator providers
+			var validatorProvider = _runMvcValidation ? _compositeProvider : _fvProvider;
+
+			var visitor = new ValidationVisitorFork(
+				actionContext,
+				validatorProvider,
+				_validatorCache,
+				_modelMetadataProvider,
+				validationState);
+
+			visitor.Validate(metadata, prefix, model);
+
+			// Re-add errors that we took out if FV didn't add a key. 
+			ReApplyImplicitRequiredErrorsNotHandledByFV(requiredErrorsNotHandledByFv);
+
+			// Remove duplicates. This can happen if someone has implicit child validation turned on and also adds an explicit child validator.
+			RemoveDuplicateModelstateEntries(actionContext);
+		}
+
+		private static void RemoveDuplicateModelstateEntries(ActionContext actionContext) {
+			foreach (var entry in actionContext.ModelState) {
+				if (entry.Value.ValidationState == ModelValidationState.Invalid) {
+					var existing = new HashSet<string>();
+
+					foreach (var err in entry.Value.Errors.ToList()) {
+						//TOList to create a copy so we can remvoe the original
+						if (existing.Contains(err.ErrorMessage)) {
+							entry.Value.Errors.Remove(err);
+						}
+						else {
+							existing.Add(err.ErrorMessage);
+						}
+					}
+				}
+			}
+		}
+
+		private static void ReApplyImplicitRequiredErrorsNotHandledByFV(List<KeyValuePair<ModelStateEntry, ModelError>> requiredErrorsNotHandledByFv) {
+			foreach (var pair in requiredErrorsNotHandledByFv) {
+				if (pair.Key.ValidationState != ModelValidationState.Invalid) {
+					pair.Key.Errors.Add(pair.Value);
+					pair.Key.ValidationState = ModelValidationState.Invalid;
+				}
+			}
+		}
+
+		private static List<KeyValuePair<ModelStateEntry, ModelError>> RemoveImplicitRequiredErrors(ActionContext actionContext) {
+			// This is all to work around the default "Required" messages.
+			var requiredErrorsNotHandledByFv = new List<KeyValuePair<ModelStateEntry, ModelError>>();
+
+			foreach (KeyValuePair<string, ModelStateEntry> entry in actionContext.ModelState) {
+				List<ModelError> errorsToModify = new List<ModelError>();
+
+				if (entry.Value.ValidationState == ModelValidationState.Invalid) {
+					foreach (var err in entry.Value.Errors) {
+						if (err.ErrorMessage.StartsWith(FluentValidationBindingMetadataProvider.Prefix)) {
+							errorsToModify.Add(err);
+						}
+					}
+
+					foreach (ModelError err in errorsToModify) {
+						entry.Value.Errors.Clear();
+						entry.Value.ValidationState = ModelValidationState.Unvalidated;
+						requiredErrorsNotHandledByFv.Add(new KeyValuePair<ModelStateEntry, ModelError>(entry.Value, new ModelError(err.ErrorMessage.Replace(FluentValidationBindingMetadataProvider.Prefix, string.Empty))));
+						;
+					}
+				}
+			}
+			return requiredErrorsNotHandledByFv;
+		}
+
+		private CustomizeValidatorAttribute GetCustomizations(ActionContext actionContext, Type type, string prefix) {
+
+			if (actionContext?.ActionDescriptor?.Parameters == null) {
+				return new CustomizeValidatorAttribute();
+			}
+
+			var descriptors = actionContext.ActionDescriptor.Parameters
+				.Where(x => x.ParameterType == type)
+				.Where(x => (x.BindingInfo != null && x.BindingInfo.BinderModelName != null && x.BindingInfo.BinderModelName == prefix) || x.Name == prefix || (prefix == string.Empty && x.BindingInfo?.BinderModelName == null))
+				.OfType<ControllerParameterDescriptor>()
+				.ToList();
+
+			CustomizeValidatorAttribute attribute = null;
+
+			if (descriptors.Count == 1) {
+				attribute = descriptors[0].ParameterInfo.GetCustomAttributes(typeof(CustomizeValidatorAttribute), true).FirstOrDefault() as CustomizeValidatorAttribute;
+			}
+			if (descriptors.Count > 1) {
+				// We found more than 1 matching with same prefix and name. 
+			}
+
+			return attribute ?? new CustomizeValidatorAttribute();
+		}
+
+	}
+
+	// Old implementation
+
+	internal class FluentValidationObjectModelValidatorOriginal : IObjectModelValidator {
 		public const string InvalidValuePlaceholder = "__FV_InvalidValue";
 		public const string ModelKeyPrefix = "__FV_Prefix_";
 
@@ -20,9 +175,9 @@
 		private CompositeModelValidatorProvider _validatorProvider;
 
 		/// <summary>
-		///     Initializes a new instance of <see cref="FluentValidationObjectModelValidator" />.
+		///     Initializes a new instance of <see cref="FluentValidationObjectModelValidatorOriginal" />.
 		/// </summary>
-		public FluentValidationObjectModelValidator(IModelMetadataProvider modelMetadataProvider, IList<IModelValidatorProvider> validatorProviders) {
+		public FluentValidationObjectModelValidatorOriginal(IModelMetadataProvider modelMetadataProvider, IList<IModelValidatorProvider> validatorProviders) {
 			_modelMetadataProvider = modelMetadataProvider ?? throw new ArgumentNullException(nameof(modelMetadataProvider));
 			_validatorCache = new ValidatorCache();
 			_validatorProvider = new CompositeModelValidatorProvider(validatorProviders);
@@ -209,117 +364,8 @@
 
 	internal class MvcCollectionValidator<T> : AbstractValidator<IEnumerable<T>> {
 		public MvcCollectionValidator(IValidator<T> validator, string prefix) {
-			if (string.IsNullOrEmpty(prefix)) prefix = FluentValidationObjectModelValidator.ModelKeyPrefix;
+			if (string.IsNullOrEmpty(prefix)) prefix = FluentValidationObjectModelValidatorOriginal.ModelKeyPrefix;
 			RuleFor(x => x).SetCollectionValidator(validator).OverridePropertyName(prefix);
 		}
-	}
-
-	internal class CustomValidationVisitor : ValidationVisitor {
-
-		private ModelStateDictionary _modelState;
-		private ValidatorCache _validatorCache;
-		private readonly IModelMetadataProvider _metadataProvider;
-		private ActionContext _actionContext;
-		private IModelValidatorProvider _validatorProvider;
-
-		private IValidatorFactory _validatorFactory;
-		private CustomizeValidatorAttribute _cutomizations;
-
-		private static Func<ValidationVisitor, string> _keyGetter;
-		private static Func<ValidationVisitor, ModelMetadata> _metadataGetter;
-		private static Func<ValidationVisitor, object> _modelGetter;
-		private static Func<ValidationVisitor, object> _containerGetter;
-		
-
-		static CustomValidationVisitor() {
-			_keyGetter = CreateGetFieldDelegate<ValidationVisitor, string>("_key");
-			_metadataGetter = CreateGetFieldDelegate<ValidationVisitor, ModelMetadata>("_metadata");
-			_modelGetter = CreateGetFieldDelegate<ValidationVisitor, object>("_model");
-			_containerGetter = CreateGetFieldDelegate<ValidationVisitor, object>("_container");
-
-		}
-
-		static public Func<S, T> CreateGetFieldDelegate<S, T>(string fieldName) {
-			var type = typeof(S);
-			var fld = type.GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic);
-
-			var instExp = Expression.Parameter(type);
-			var fieldExp = Expression.Field(instExp, fld);
-			return Expression.Lambda<Func<S, T>>(fieldExp, instExp).Compile();
-		}
-
-		public CustomValidationVisitor(ActionContext actionContext, IModelValidatorProvider validatorProvider, ValidatorCache validatorCache, IModelMetadataProvider metadataProvider, ValidationStateDictionary validationState, IValidatorFactory validatorFactory, CustomizeValidatorAttribute cutomizations) : base(actionContext, validatorProvider, validatorCache, metadataProvider, validationState) {
-			_modelState = actionContext.ModelState;
-			_validatorCache = validatorCache;
-			_metadataProvider = metadataProvider;
-			_validatorFactory = validatorFactory;
-			_cutomizations = cutomizations;
-			_actionContext = actionContext;
-			_validatorProvider = validatorProvider;
-		}
-
-
-		protected override bool ValidateNode() {
-			// private field workaround...
-			string _key = _keyGetter(this);
-			var _metadata = _metadataGetter(this);
-			var _container = _containerGetter(this);
-			var _model = _modelGetter(this);
-
-			// This method is dupliated from MVC's VlaidationVisitor.cs
-			// They only validate if validationstate != invalid, but if there's a FV validator, we want to override this behaviour. 
-
-			var fluentValidator = _validatorFactory.GetValidator(_metadata.ModelType);
-
-			var state = _modelState.GetValidationState(_key);
-			// Rationale: we might see the same model state key used for two different objects.
-			// We want to run validation unless it's already known that this key is invalid.
-			if (state != ModelValidationState.Invalid || fluentValidator != null) {
-				var validators = _validatorCache.GetValidators(_metadata, _validatorProvider).ToList();
-
-				if (fluentValidator != null) {
-					validators.Add(new FluentValidationModelValidator(fluentValidator, _cutomizations));
-				}
-
-				var count = validators.Count;
-				if (count > 0) {
-					var context = new ModelValidationContext(
-						_actionContext,
-						_metadata,
-						_metadataProvider,
-						_container,
-						_model);
-
-					var results = new List<ModelValidationResult>();
-					for (var i = 0; i < count; i++) {
-						results.AddRange(validators[i].Validate(context));
-					}
-
-					var resultsCount = results.Count;
-					for (var i = 0; i < resultsCount; i++) {
-						var result = results[i];
-						var key = ModelNames.CreatePropertyModelName(_key, result.MemberName);
-						_modelState.TryAddModelError(key, result.Message);
-					}
-				}
-			}
-
-			state = _modelState.GetFieldValidationState(_key);
-
-			if (state == ModelValidationState.Invalid) {
-				return false;
-			} else {
-				// If the field has an entry in ModelState, then record it as valid. Don't create
-				// extra entries if they don't exist already.
-				var entry = _modelState[_key];
-				if (entry != null) {
-					entry.ValidationState = ModelValidationState.Valid;
-				}
-
-				return true;
-			}
-		}
-
-
 	}
 }
